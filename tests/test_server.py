@@ -423,6 +423,67 @@ class TitleNoiseTests(unittest.TestCase):
         self.assertFalse(server._is_title_noise("fix the failing test"))
 
 
+class BoardFormatApiTests(_HttpCase):
+    """GET /api/board?fmt=… over the real Handler: the parameter is validated at
+    the door, and the ETag tells the two formats apart for free (ADR 0029)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._saved = {n: getattr(server, n) for n in ("_board", "_tmux_server_down")}
+        server._tmux_server_down = lambda: False
+        # Stand in for the whole board: only the format-sensitive part matters.
+        server._board = lambda focus_sid="", fmt="html": {
+            "focus": {"scrollback": [{"role": "assistant"}
+                                     | ({"md": "hi"} if fmt == "md" else {"html": "<p>hi</p>"})]},
+            "upnext": [], "watching": [], "snoozed": [], "dormant": [],
+            "foreign": [], "counts": {}, "serverDown": False}
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=2)
+        for n, v in cls._saved.items():
+            setattr(server, n, v)
+
+    def _get(self, path, headers=None):
+        status, text, hdrs = self._raw("GET", path, headers=headers)
+        try:
+            return status, json.loads(text), hdrs
+        except ValueError:
+            return status, {"message": text}, hdrs
+
+    def test_no_fmt_serves_html(self):
+        _, body, _ = self._get("/api/board")
+        self.assertIn("html", body["focus"]["scrollback"][0])
+
+    def test_fmt_md_serves_markdown(self):
+        _, body, _ = self._get("/api/board?fmt=md")
+        self.assertEqual(body["focus"]["scrollback"][0]["md"], "hi")
+
+    def test_an_unknown_fmt_is_rejected_not_defaulted(self):
+        # Failing loud beats handing a phone HTML it cannot render and letting it
+        # break somewhere far from the cause, with no console to read.
+        status, body, _ = self._get("/api/board?fmt=xml")
+        self.assertEqual(status, 400)
+        self.assertIn("unknown fmt", body["message"])
+
+    def test_the_two_formats_do_not_share_an_etag(self):
+        _, _, h_html = self._get("/api/board")
+        _, _, h_md = self._get("/api/board?fmt=md")
+        self.assertNotEqual(h_html["ETag"], h_md["ETag"])
+
+    def test_revalidation_still_304s_within_one_format(self):
+        _, _, h = self._get("/api/board?fmt=md")
+        status, _, _ = self._raw("GET", "/api/board?fmt=md",
+                                 headers={"If-None-Match": h["ETag"]})
+        self.assertEqual(status, 304)
+
+
 class RecoverableApiTests(_HttpCase):
     """GET /api/recoverable serves the Resumable-Session list as JSON with an
     ETag, mirroring /api/board and /api/tasks — read-only, no token gate."""
@@ -2831,6 +2892,53 @@ _IDLE_ROWS = [
     {"type": "assistant", "message": {"content": [
         {"type": "text", "text": "Both work. Do you want the bounded tail or the whole thread?"}]}},
 ]
+
+
+class MarkdownOnTheWireTests(unittest.TestCase):
+    """`fmt=md` hands a native client the markdown source of a prose **Turn**
+    instead of the HTML ADR 0006 renders — Compose has no HTML sink (ADR 0029).
+    One server, two clients, neither constraining the other."""
+
+    _PROSE = [
+        {"type": "user", "message": {"content": [{"type": "text", "text": "ship **it**"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "on `it`"}]}},
+    ]
+
+    def test_the_default_is_untouched_html(self):
+        # The web Board asks for nothing and must get exactly what it got before.
+        turns = server._scrollback(self._PROSE)
+        self.assertEqual(turns[0]["html"], server._md_to_html("ship **it**"))
+        self.assertNotIn("md", turns[0])
+
+    def test_md_carries_the_source_and_no_html(self):
+        turns = server._scrollback(self._PROSE, "md")
+        self.assertEqual([t["md"] for t in turns], ["ship **it**", "on `it`"])
+        for t in turns:
+            self.assertNotIn("html", t)
+        # The roles are the format's business too — same entries, same order.
+        self.assertEqual([t["role"] for t in turns], ["user", "assistant"])
+
+    def test_a_work_run_and_a_command_are_the_same_in_both_formats(self):
+        # Neither was ever HTML (`_scrollback`: "a work run's calls are NOT html
+        # and never become any"), so the format must not touch them.
+        rows = [
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": "<command-name>/ship</command-name>"}]}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "a", "name": "Bash",
+                 "input": {"command": "ls"}}]}},
+        ]
+        self.assertEqual(server._scrollback(rows), server._scrollback(rows, "md"))
+
+    def test_both_formats_window_the_same_text(self):
+        # The clip is what decides where a long turn ends. Two formats clipping
+        # differently would mean the app and the Board disagree about the turn.
+        long = "x" * (server._TURN_MAX + 500)
+        md = server._scrollback(
+            [{"type": "assistant", "message": {"content": [
+                {"type": "text", "text": long}]}}], "md")[0]["md"]
+        self.assertEqual(md, server._clip(long, server._TURN_MAX))
+        self.assertLess(len(md), len(long))
 
 
 class FocusScrollbackTests(unittest.TestCase):

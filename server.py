@@ -2254,11 +2254,12 @@ def _call_of(tu: dict) -> dict:
     return {"name": name, "detail": _clip(" ".join(detail.split()), _CALL_MAX)}
 
 
-def _scrollback(rows: list) -> list[dict]:
+def _scrollback(rows: list, fmt: str = "html") -> list[dict]:
     """The recent entries of a **Session**, oldest first — what the **Focus**
     reads (ADR 0014, reshaped by ADR 0016). One entry is one of three things:
 
         {"role": "user"|"assistant", "html": …}   prose someone produced
+                        …or "md" instead, when fmt="md" (ADR 0029)
         {"role": "command", "cmd": "/ship"}       a slash command you invoked
         {"role": "work", "calls": [{name, detail}, …], "n": 7}
 
@@ -2309,7 +2310,12 @@ def _scrollback(rows: list) -> list[dict]:
         if not text and not tus:
             continue
         if text:
-            out.append({"role": o["type"], "html": _md_to_html(_clip(text, _TURN_MAX))})
+            # The clip is outside the format branch on purpose: both formats have
+            # to window the SAME text, or the native client and the Board would
+            # disagree about where a long turn ends (ADR 0029).
+            clipped = _clip(text, _TURN_MAX)
+            out.append({"role": o["type"], "md": clipped} if fmt == "md"
+                       else {"role": o["type"], "html": _md_to_html(clipped)})
         if tus:
             # Extend the run in progress rather than opening a second one. `n`
             # counts every call; `calls` carries the last _RUN_CALLS of them, so
@@ -2966,7 +2972,7 @@ def _tmux_server_down() -> bool:
         return True
 
 
-def _board(focus_sid: str = "") -> dict:
+def _board(focus_sid: str = "", fmt: str = "html") -> dict:
     now = time.time() * 1000
     items = []
     # cached_runs, never cached_all_runs: a Foreign Run is never Blocked, never
@@ -3070,7 +3076,7 @@ def _board(focus_sid: str = "") -> dict:
         # One parse of the tail, two derivations: the **Ask** and the
         # **Scrollback** (ADR 0014 — the scrollback costs no second file read).
         rows = _tail_rows(focus["sessionId"])
-        scrollback = _scrollback(rows)
+        scrollback = _scrollback(rows, fmt)
         # None, not 0 — the payload never claims a cursor position nobody read
         # (ADR 0020: `cursor 0` was a default that drove keystrokes for months).
         cursor = None
@@ -3219,10 +3225,17 @@ def _foreign_items() -> list[dict]:
     return rows
 
 
-def _board_payload(focus_sid: str = "") -> tuple[bytes, str]:
+BOARD_FORMATS = ("html", "md")
+
+
+def _board_payload(focus_sid: str = "", fmt: str = "html") -> tuple[bytes, str]:
     """Board JSON + ETag. No wall-clock in the body — the client formats ages
-    from raw `updatedAt`, so an unchanged board yields a stable ETag/304."""
-    body = json.dumps(_board(focus_sid), separators=(",", ":")).encode("utf-8")
+    from raw `updatedAt`, so an unchanged board yields a stable ETag/304.
+
+    `fmt` picks how a prose **Turn** crosses the wire (ADR 0029). The ETag needs
+    no help to tell them apart: it is a hash of this body, and the two bodies
+    differ."""
+    body = json.dumps(_board(focus_sid, fmt), separators=(",", ":")).encode("utf-8")
     return body, '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
 
 
@@ -3325,8 +3338,16 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_web("theme.js")
             return
         if path == "/api/board":
-            focus_sid = (parse_qs(urlparse(self.path).query).get("focus") or [""])[0]
-            body, etag = _board_payload(focus_sid if _UUID_RE.match(focus_sid) else "")
+            query = parse_qs(urlparse(self.path).query)
+            focus_sid = (query.get("focus") or [""])[0]
+            # Rejected, never defaulted. A native client that typos `fmt` would
+            # otherwise be handed HTML it has no sink for and fail somewhere far
+            # from the cause — on a phone, with no console (ADR 0029).
+            fmt = (query.get("fmt") or ["html"])[0]
+            if fmt not in BOARD_FORMATS:
+                self._fail(400, f"unknown fmt (want one of {', '.join(BOARD_FORMATS)})")
+                return
+            body, etag = _board_payload(focus_sid if _UUID_RE.match(focus_sid) else "", fmt)
             if self.headers.get("If-None-Match") == etag:
                 self._send(304, b"", "application/json; charset=utf-8", {"ETag": etag})
                 return
