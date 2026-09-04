@@ -4,6 +4,12 @@ The AttSD server spawns, observes, and answers local Claude Code Runs; the
 Board is the page you drive it from. See `CONTEXT.md` for the domain glossary
 and `docs/adr/` for the decisions behind the design.
 
+There are **two clients** on the `/api/*` surface, not one: the Board served
+from `web/` here, and the Android app in the sibling repo
+`~/projects/attsd-native`. An endpoint's shape is a contract with both — a
+change to a request body, a status code, or a payload field breaks the phone
+silently, because nothing in this repo compiles against it.
+
 ## Agent skills
 
 ### Issue tracker
