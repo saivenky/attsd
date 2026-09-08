@@ -1,0 +1,4 @@
+# server.py and the rest of the repo are stdlib-only. This file exists
+# solely for tools/pair-qr.py, which renders a terminal QR code and has no
+# stdlib equivalent for that.
+qrcode>=7.4,<9

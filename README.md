@@ -169,6 +169,21 @@ off the Claude app. Notes:
 | `ATTSD_REMOTE` | `1` | Append `--remote-control` so the Claude app can drive the session. Set `0` to disable. |
 | `ATTSD_TOKEN` | *(unset)* | Shared secret for the board's **Respond**. Unset disables Respond; the board stays read-only. |
 
+## Pairing the Android app
+
+Instead of reading `ATTSD_TOKEN` off the screen and typing it into the
+phone by hand, scan it in:
+
+```sh
+pip install -r requirements.txt   # once, for the qrcode package
+tools/pair-qr.py --name Home
+```
+
+Prints a terminal QR code for the Tailscale IP + token (the URI is also
+printed as a copy-paste fallback below it). Point the phone camera at it
+from the app's add-profile screen. Requires `ATTSD_TOKEN` to be set and
+`tailscale` on `PATH`; pass `--host` to override the auto-detected address.
+
 ## Security model
 
 **Trusted networks only** — Tailscale, or LAN behind a firewall. Lifecycle
