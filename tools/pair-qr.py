@@ -12,11 +12,13 @@ change:
 
     attsd://profile?name=<urlencoded>&host=<urlencoded>&token=<urlencoded>
 
-`host` is the URL the phone must actually reach this server at, so it is the
-Tailscale IPv4 (`tailscale ip -4`), never `localhost` -- meaningless off the
-Mac, and ADR 0001 already settled Tailscale as the transport. Override with
---host if you're on a plain LAN instead, or `tailscale` is not the transport
-you're using.
+`host` is the URL the phone must actually reach this server at, so it is
+never `localhost` -- meaningless off the Mac. Discovery tries, in order: the
+address the server is actually bound to (if not a wildcard), the Tailscale
+IPv4 (`tailscale ip -4`, per ADR 0001), the LAN IPv4 of the default-route
+interface, and finally this machine's mDNS name. The winning method is
+printed to stderr so it's obvious which network the QR describes; pass
+--host to skip discovery outright.
 
 The port and the token are never taken from *this shell's* environment --
 `ATTSD_TOKEN` exported here could be stale, unset, or simply not what the
@@ -140,15 +142,132 @@ def _tailscale_ip() -> str | None:
     return ip or None
 
 
-def default_host(port: str) -> str:
-    ip = _tailscale_ip()
-    if not ip:
+_WILDCARD_ADDRESSES = {"*", "0.0.0.0", "::"}
+
+
+def _listening_address(pid: int) -> str | None:
+    """The address component of server.py's live listening socket, read from
+    the same `lsof` view _listening_port uses. `*`, `0.0.0.0` and `::` all
+    mean "every interface" -- not an answer, just a wildcard -- so only a
+    genuinely specific bound address is returned; when the server is bound
+    to one, that address is the only host a phone can reach it at, so
+    default_host uses it and stops rather than treating it as one candidate
+    among several."""
+    out = subprocess.run(
+        ["lsof", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN", "-Pn"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    m = re.search(r"TCP\s+(\S+):\d+\s*\(LISTEN\)", out.stdout)
+    if not m:
+        return None
+    addr = m.group(1).strip("[]")
+    return None if addr in _WILDCARD_ADDRESSES else addr
+
+
+def _lan_ip() -> str | None:
+    """The IPv4 of whichever interface this Mac's default route goes out of
+    -- found via `route -n get default` rather than assuming en0, since a
+    laptop moves between Wi-Fi, Ethernet, and USB adapters and the default
+    route lands on a different interface each time."""
+    try:
+        route_out = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if route_out.returncode != 0:
+        return None
+    m = re.search(r"interface:\s*(\S+)", route_out.stdout)
+    if not m:
+        return None
+    iface = m.group(1)
+    try:
+        ip_out = subprocess.run(
+            ["ipconfig", "getifaddr", iface],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if ip_out.returncode != 0:
+        return None
+    ip = ip_out.stdout.strip()
+    return ip or None
+
+
+def _mdns_host() -> str | None:
+    """This machine's mDNS name -- `<hostname>.local`, or the hostname
+    unchanged if it already ends in `.local`. This repo's own scripts/
+    already publish to a bare hostname on this network, so mDNS
+    demonstrably resolves here -- a legitimate fallback, not a guess of last
+    resort."""
+    try:
+        out = subprocess.run(
+            ["hostname"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    name = out.stdout.strip()
+    if not name:
+        return None
+    return name if name.endswith(".local") else f"{name}.local"
+
+
+def default_host(pid: int, port: str) -> str:
+    """Derive the host to put in the QR, trying candidates in priority order
+    and falling through rather than dead-ending on the first miss. A
+    specific bound address wins outright and short-circuits the rest --
+    the server truly is not reachable anywhere else. Otherwise every
+    candidate that resolves is printed to stderr (never stdout, and never
+    the token) so a QR built for the wrong network is visible at a glance
+    instead of a silent guess."""
+    candidates: list[tuple[str, str]] = []  # (label, address)
+
+    bound = _listening_address(pid)
+    if bound:
+        candidates.append(("bound address", bound))
+    else:
+        ts = _tailscale_ip()
+        if ts:
+            candidates.append(("Tailscale", ts))
+        lan = _lan_ip()
+        if lan:
+            candidates.append(("LAN", lan))
+        mdns = _mdns_host()
+        if mdns:
+            candidates.append(("mDNS", mdns))
+
+    if not candidates:
         sys.exit(
-            "pair-qr: could not read a Tailscale IPv4 (`tailscale ip -4` failed -- "
-            "is Tailscale installed and running?). Pass --host explicitly, e.g. "
+            "pair-qr: could not derive a host -- tried the server's bound "
+            "address, `tailscale ip -4`, the default-route LAN interface "
+            "(`route -n get default` / `ipconfig getifaddr`), and the mDNS "
+            "hostname, and none produced one. Pass --host explicitly, e.g. "
             "--host http://192.168.1.20:8765"
         )
-    return f"http://{ip}:{port}"
+
+    label, chosen = candidates[0]
+    print(
+        f"pair-qr: using {label} host {chosen} (--host to override)",
+        file=sys.stderr,
+    )
+    for other_label, other_addr in candidates[1:]:
+        print(
+            f"pair-qr: also found {other_label} host {other_addr} -- pass "
+            f"--host http://{other_addr}:{port} to use it instead",
+            file=sys.stderr,
+        )
+    return f"http://{chosen}:{port}"
 
 
 def build_uri(host: str, token: str, name: str | None) -> str:
@@ -167,7 +286,7 @@ def main() -> None:
     parser.add_argument("--name", help="human label shown on the phone, e.g. Home")
     parser.add_argument(
         "--host",
-        help="override the auto-detected Tailscale URL, e.g. http://192.168.1.20:8765",
+        help="override host auto-detection outright, e.g. http://192.168.1.20:8765",
     )
     args = parser.parse_args()
 
@@ -185,7 +304,7 @@ def main() -> None:
         )
 
     port = _listening_port(pid) or env.get("ATTSD_PORT", DEFAULT_PORT)
-    host = args.host or default_host(port)
+    host = args.host or default_host(pid, port)
     uri = build_uri(host, token, args.name)
 
     qr = qrcode.QRCode(border=2)
